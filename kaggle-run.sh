@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -e  # exit on any error
 
 printf "\033]0;Kaggle Applio Installer\007"
 clear
@@ -9,25 +9,31 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-log "Updating apt and installing FFmpeg..."
-sudo apt-get update -y
-sudo apt-get install -y ffmpeg
+# 1) System dependencies
+log "Installing FFmpeg (via apt)..."
+apt-get update -y && apt-get install -y ffmpeg
 
-log "Upgrading pip and installing Python packages..."
+# 2) Python dependencies
+log "Upgrading pip and installing python-ffmpeg..."
 python3 -m pip install --upgrade pip
-python3 -m pip install python-ffmpeg
+pip install python-ffmpeg
 
+# 3) Install Python packages from requirements.txt if present
 if [ -f requirements.txt ]; then
-  python3 -m pip install -r requirements.txt
+  log "Installing requirements.txt dependencies..."
+  pip install -r requirements.txt
 else
   log "⚠️ requirements.txt not found — skipping."
 fi
 
-log "Installing PyTorch (CUDA 11.7 build)..."
-python3 -m pip install torch==2.7.1+cu117 torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu117
+# 4) Install PyTorch (CPU-only for compatibility on Kaggle)
+log "Installing PyTorch 2.7.1 (CPU version)..."
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
 
+# 5) Optional PyTorch env vars (mostly macOS-specific, but harmless)
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 
-log "Launching Applio..."
+# 6) Run Applio app
+log "Starting Applio..."
 python3 app.py --open
