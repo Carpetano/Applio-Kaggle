@@ -34,4 +34,4 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 
 # 6) Launch
 log "Starting Applio..."
-python3 app.py --open
+python3 app.py --share --open
