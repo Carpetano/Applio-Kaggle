@@ -14,7 +14,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -64,15 +63,35 @@ vocoder = sys.argv[15]
 checkpointing = strtobool(sys.argv[16])
 # experimental settings
 randomized = True
-optimizer = "AdamW"
-# optimizer = "RAdam"
 d_lr_coeff = 1.0
 g_lr_coeff = 1.0
+d_step_per_g_step = 1
+multiscale_mel_loss = False
+bf16_adamw = False
 
 current_dir = os.getcwd()
+
+try:
+    with open(os.path.join(current_dir, "assets", "config.json"), "r") as f:
+        config = json.load(f)
+        precision = config["precision"]
+        if (
+            precision == "bf16"
+            and torch.cuda.is_available()
+            and torch.cuda.is_bf16_supported()
+        ):
+            train_dtype = torch.bfloat16
+        elif precision == "fp16" and torch.cuda.is_available():
+            train_dtype = torch.float16
+        else:
+            train_dtype = torch.float32
+except (FileNotFoundError, json.JSONDecodeError, KeyError):
+    train_dtype = torch.float32
+
 experiment_dir = os.path.join(current_dir, "logs", model_name)
 config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
+model_info_path = os.path.join(experiment_dir, "model_info.json")
 
 try:
     with open(config_save_path, "r") as f:
@@ -103,6 +122,7 @@ avg_losses = {
     "grad_d_50": deque(maxlen=50),
     "grad_g_50": deque(maxlen=50),
     "disc_loss_50": deque(maxlen=50),
+    "adv_loss_50": deque(maxlen=50),
     "fm_loss_50": deque(maxlen=50),
     "kl_loss_50": deque(maxlen=50),
     "mel_loss_50": deque(maxlen=50),
@@ -135,25 +155,6 @@ class EpochRecorder:
         return f"time={current_time} | training_speed={elapsed_time_str}"
 
 
-def verify_checkpoint_shapes(checkpoint_path, model):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    checkpoint_state_dict = checkpoint["model"]
-    try:
-        if hasattr(model, "module"):
-            model_state_dict = model.module.load_state_dict(checkpoint_state_dict)
-        else:
-            model_state_dict = model.load_state_dict(checkpoint_state_dict)
-    except RuntimeError:
-        print(
-            "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-        )
-        sys.exit(1)
-    else:
-        del checkpoint
-        del checkpoint_state_dict
-        del model_state_dict
-
-
 def main():
     """
     Main function to start the training process.
@@ -168,9 +169,9 @@ def main():
     )
     if wavs:
         _, sr = load_wav_to_torch(wavs[0])
-        if sr != sample_rate:
+        if sr != config.data.sample_rate:
             print(
-                f"Error: Pretrained model sample rate ({sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
+                f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
             )
             os._exit(1)
     else:
@@ -319,7 +320,7 @@ def run(
         config (object): Configuration object containing training parameters.
         device (torch.device): The device to use for training (CPU or GPU).
     """
-    global global_step, smoothed_value_gen, smoothed_value_disc, optimizer
+    global global_step, smoothed_value_gen, smoothed_value_disc
 
     smoothed_value_gen = 0
     smoothed_value_disc = 0
@@ -376,28 +377,36 @@ def run(
             "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
         )
         os._exit(2333333)
-    else:
-        g_file = latest_checkpoint_path(experiment_dir, "G_*.pth")
-        if g_file != None:
-            print("Checking saved weights...")
-            g = torch.load(g_file, map_location="cpu")
-            if (
-                optimizer == "RAdam"
-                and "amsgrad" in g["optimizer"]["param_groups"][0].keys()
-            ):
-                optimizer = "AdamW"
-                print(
-                    f"Optimizer choice has been reverted to {optimizer} to match the saved D/G weights."
-                )
-            elif (
-                optimizer == "AdamW"
-                and "decoupled_weight_decay" in g["optimizer"]["param_groups"][0].keys()
-            ):
-                optimizer = "RAdam"
-                print(
-                    f"Optimizer choice has been reverted to {optimizer} to match the saved D/G weights."
-                )
-            del g
+
+    # defaults
+    embedder_name = "contentvec"
+    spk_dim = config.model.spk_embed_dim  # 109 default speakers
+
+    try:
+        with open(model_info_path, "r") as f:
+            model_info = json.load(f)
+            embedder_name = model_info["embedder_model"]
+            spk_dim = model_info["speakers_id"]
+    except Exception as e:
+        print(f"Could not load model info file: {e}. Using defaults.")
+
+    # Try to load speaker dim from latest checkpoint or pretrainG
+    try:
+        last_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
+        chk_path = (
+            last_g if last_g else (pretrainG if pretrainG not in ("", "None") else None)
+        )
+
+        if chk_path:
+            ckpt = torch.load(chk_path, map_location="cpu", weights_only=True)
+            spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
+            del ckpt
+    except Exception as e:
+        print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
+
+    # update config before the model init
+    print(f"Initializing the generator with {spk_dim} speakers.")
+    config.model.spk_embed_dim = spk_dim
 
     # Initialize models and optimizers
     from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminator
@@ -408,7 +417,7 @@ def run(
         config.train.segment_size // config.data.hop_length,
         **config.model,
         use_f0=True,
-        sr=sample_rate,
+        sr=config.data.sample_rate,
         vocoder=vocoder,
         checkpointing=checkpointing,
         randomized=randomized,
@@ -425,10 +434,14 @@ def run(
         net_g = net_g.to(device)
         net_d = net_d.to(device)
 
-    if optimizer == "AdamW":
+    if bf16_adamw == True and train_dtype == torch.bfloat16:
+        print("Using BFload16 AdamW optimizer")
+        from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
+
+        optimizer = AnyPrecisionAdamW
+    else:
+        print("Using AdamW optimizer")
         optimizer = torch.optim.AdamW
-    elif optimizer == "RAdam":
-        optimizer = torch.optim.RAdam
 
     optim_g = optimizer(
         net_g.parameters(),
@@ -442,61 +455,77 @@ def run(
         betas=config.train.betas,
         eps=config.train.eps,
     )
-
-    fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=sample_rate)
+    if multiscale_mel_loss:
+        fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=config.data.sample_rate)
+        print("Using Multi-Scale Mel loss function")
+    else:
+        fn_mel_loss = torch.nn.L1Loss()
+        print("Using Single-Scale Mel loss function")
 
     # Wrap models with DDP for multi-gpu processing
     if n_gpus > 1 and device.type == "cuda":
         net_g = DDP(net_g, device_ids=[device_id])
         net_d = DDP(net_d, device_ids=[device_id])
 
+    if rank == 0 and train_dtype == torch.bfloat16:
+        print("Using BFloat16 for training.")
+    elif rank == 0 and train_dtype == torch.float16:
+        print("Using Float16 for training.")
+
     # Load checkpoint if available
+    scaler_dict = {}
     try:
         print("Starting training...")
-        _, _, _, epoch_str = load_checkpoint(
+        _, _, _, epoch_str, scaler_dict = load_checkpoint(
             latest_checkpoint_path(experiment_dir, "D_*.pth"), net_d, optim_d
         )
-        _, _, _, epoch_str = load_checkpoint(
+        _, _, _, epoch_str, _ = load_checkpoint(
             latest_checkpoint_path(experiment_dir, "G_*.pth"), net_g, optim_g
         )
         epoch_str += 1
         global_step = (epoch_str - 1) * len(train_loader)
 
-    except:
+    except Exception as e:
         epoch_str = 1
         global_step = 0
-        if pretrainG != "" and pretrainG != "None":
-            if rank == 0:
-                verify_checkpoint_shapes(pretrainG, net_g)
-                print(f"Loaded pretrained (G) '{pretrainG}'")
-            if hasattr(net_g, "module"):
-                net_g.module.load_state_dict(
-                    torch.load(pretrainG, map_location="cpu", weights_only=True)[
-                        "model"
-                    ]
-                )
-            else:
-                net_g.load_state_dict(
-                    torch.load(pretrainG, map_location="cpu", weights_only=True)[
-                        "model"
-                    ]
-                )
 
-        if pretrainD != "" and pretrainD != "None":
+        if pretrainG not in ("", "None"):
+            if rank == 0:
+                print(f"Loaded pretrained (G) '{pretrainG}'")
+            try:
+                ckpt = torch.load(pretrainG, map_location="cpu", weights_only=True)[
+                    "model"
+                ]
+                if hasattr(net_g, "module"):
+                    net_g.module.load_state_dict(ckpt)
+                else:
+                    net_g.load_state_dict(ckpt)
+                del ckpt
+            except Exception as e:
+                print(
+                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
+                )
+                print(e)
+                sys.exit(1)
+
+        if pretrainD not in ("", "None"):
             if rank == 0:
                 print(f"Loaded pretrained (D) '{pretrainD}'")
-            if hasattr(net_d, "module"):
-                net_d.module.load_state_dict(
-                    torch.load(pretrainD, map_location="cpu", weights_only=True)[
-                        "model"
-                    ]
+            try:
+                ckpt = torch.load(pretrainD, map_location="cpu", weights_only=True)[
+                    "model"
+                ]
+                if hasattr(net_d, "module"):
+                    net_d.module.load_state_dict(ckpt)
+                else:
+                    net_d.load_state_dict(ckpt)
+                del ckpt
+            except Exception as e:
+                print(
+                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
                 )
-            else:
-                net_d.load_state_dict(
-                    torch.load(pretrainD, map_location="cpu", weights_only=True)[
-                        "model"
-                    ]
-                )
+                print(e)
+                sys.exit(1)
 
     # Initialize schedulers
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
@@ -506,23 +535,24 @@ def run(
         optim_d, gamma=config.train.lr_decay, last_epoch=epoch_str - 2
     )
 
+    use_scaler = device.type == "cuda" and train_dtype == torch.float16
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+    if len(scaler_dict) > 0:
+        scaler.load_state_dict(scaler_dict)
+
     cache = []
-    # get the first sample as reference for tensorboard evaluation
-    # custom reference temporarily disabled
-    if True == False and os.path.isfile(
-        os.path.join("logs", "reference", f"ref{sample_rate}.wav")
-    ):
-        phone = np.load(
-            os.path.join("logs", "reference", f"ref{sample_rate}_feats.npy")
-        )
+    # collect the reference audio for tensorboard evaluation
+    if os.path.isfile(os.path.join("logs", "reference", embedder_name, "feats.npy")):
+        print("Using", embedder_name, "reference set for validation")
+        phone = np.load(os.path.join("logs", "reference", embedder_name, "feats.npy"))
         # expanding x2 to match pitch size
         phone = np.repeat(phone, 2, axis=0)
+        phone_lengths = torch.LongTensor([phone.shape[0]]).to(device)
         phone = torch.FloatTensor(phone).unsqueeze(0).to(device)
-        phone_lengths = torch.LongTensor(phone.size(0)).to(device)
-        pitch = np.load(os.path.join("logs", "reference", f"ref{sample_rate}_f0c.npy"))
+        pitch = np.load(os.path.join("logs", "reference", "pitch_coarse.npy"))
         # removed last frame to match features
         pitch = torch.LongTensor(pitch[:-1]).unsqueeze(0).to(device)
-        pitchf = np.load(os.path.join("logs", "reference", f"ref{sample_rate}_f0f.npy"))
+        pitchf = np.load(os.path.join("logs", "reference", "pitch_fine.npy"))
         # removed last frame to match features
         pitchf = torch.FloatTensor(pitchf[:-1]).unsqueeze(0).to(device)
         sid = torch.LongTensor([0]).to(device)
@@ -534,25 +564,16 @@ def run(
             sid,
         )
     else:
-        for info in train_loader:
-            phone, phone_lengths, pitch, pitchf, _, _, _, _, sid = info
-            if device.type == "cuda":
-                reference = (
-                    phone.cuda(device_id, non_blocking=True),
-                    phone_lengths.cuda(device_id, non_blocking=True),
-                    pitch.cuda(device_id, non_blocking=True),
-                    pitchf.cuda(device_id, non_blocking=True),
-                    sid.cuda(device_id, non_blocking=True),
-                )
-            else:
-                reference = (
-                    phone.to(device),
-                    phone_lengths.to(device),
-                    pitch.to(device),
-                    pitchf.to(device),
-                    sid.to(device),
-                )
-            break
+        print("No custom reference found, using a default audio sample for validation")
+        info = next(iter(train_loader))
+        phone, phone_lengths, pitch, pitchf, _, _, _, _, sid = info
+        reference = (
+            phone.to(device),
+            phone_lengths.to(device),
+            pitch.to(device),
+            pitchf.to(device),
+            sid.to(device),
+        )
 
     for epoch in range(epoch_str, total_epoch + 1):
         train_and_evaluate(
@@ -570,6 +591,7 @@ def run(
             device_id,
             reference,
             fn_mel_loss,
+            scaler,
         )
 
         scheduler_g.step()
@@ -591,6 +613,7 @@ def train_and_evaluate(
     device_id,
     reference,
     fn_mel_loss,
+    scaler,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -623,6 +646,10 @@ def train_and_evaluate(
 
     net_g.train()
     net_d.train()
+
+    use_amp = device.type == "cuda" and (
+        train_dtype == torch.bfloat16 or train_dtype == torch.float16
+    )
 
     # Data caching
     if device.type == "cuda" and cache_data_in_gpu:
@@ -658,33 +685,72 @@ def train_and_evaluate(
                 sid,
             ) = info
 
-            # Forward pass
-            model_output = net_g(
-                phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
-            )
-            y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (
-                model_output
-            )
-            # slice of the original waveform to match a generate slice
-            if randomized:
-                wave = commons.slice_segments(
-                    wave,
-                    ids_slice * config.data.hop_length,
-                    config.train.segment_size,
-                    dim=3,
+            with torch.amp.autocast(
+                device_type="cuda", enabled=use_amp, dtype=train_dtype
+            ):
+                # Forward pass
+                model_output = net_g(
+                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
                 )
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-            loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
-            # Discriminator backward and update
-            optim_d.zero_grad()
-            loss_disc.backward()
-            grad_norm_d = commons.grad_norm(net_d.parameters())
-            optim_d.step()
+                y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (
+                    model_output
+                )
+                # slice of the original waveform to match a generate slice
+                if randomized:
+                    wave = commons.slice_segments(
+                        wave,
+                        ids_slice * config.data.hop_length,
+                        config.train.segment_size,
+                        dim=3,
+                    )
+            for _ in range(d_step_per_g_step):  # default x1
+                with torch.amp.autocast(
+                    device_type="cuda", enabled=use_amp, dtype=train_dtype
+                ):
+                    y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
+                loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                # Discriminator backward and update
+                optim_d.zero_grad()
+                if train_dtype == torch.float16:
+                    scaler.scale(loss_disc).backward()
+                    scaler.unscale_(optim_d)
+                    grad_norm_d = commons.grad_norm(net_d.parameters())
+                    scaler.step(optim_d)
+                else:
+                    loss_disc.backward()
+                    grad_norm_d = commons.grad_norm(net_d.parameters())
+                    optim_d.step()
 
-            # Generator backward and update
-            _, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+            with torch.amp.autocast(
+                device_type="cuda", enabled=use_amp, dtype=train_dtype
+            ):
+                # Generator backward and update
+                _, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
 
-            loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
+            if multiscale_mel_loss:
+                loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
+            else:
+                wave_mel = mel_spectrogram_torch(
+                    wave.float().squeeze(1),
+                    config.data.filter_length,
+                    config.data.n_mel_channels,
+                    config.data.sample_rate,
+                    config.data.hop_length,
+                    config.data.win_length,
+                    config.data.mel_fmin,
+                    config.data.mel_fmax,
+                )
+                y_hat_mel = mel_spectrogram_torch(
+                    y_hat.float().squeeze(1),
+                    config.data.filter_length,
+                    config.data.n_mel_channels,
+                    config.data.sample_rate,
+                    config.data.hop_length,
+                    config.data.win_length,
+                    config.data.mel_fmin,
+                    config.data.mel_fmax,
+                )
+                loss_mel = fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
             loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
             loss_fm = feature_loss(fmap_r, fmap_g)
             loss_gen, _ = generator_loss(y_d_hat_g)
@@ -697,9 +763,16 @@ def train_and_evaluate(
                     "epoch": epoch,
                 }
             optim_g.zero_grad()
-            loss_gen_all.backward()
-            grad_norm_g = commons.grad_norm(net_g.parameters())
-            optim_g.step()
+            if train_dtype == torch.float16:
+                scaler.scale(loss_gen_all).backward()
+                scaler.unscale_(optim_g)
+                grad_norm_g = commons.grad_norm(net_g.parameters())
+                scaler.step(optim_g)
+                scaler.update()
+            else:
+                loss_gen_all.backward()
+                grad_norm_g = commons.grad_norm(net_g.parameters())
+                optim_g.step()
 
             global_step += 1
 
@@ -707,6 +780,7 @@ def train_and_evaluate(
             avg_losses["grad_d_50"].append(grad_norm_d)
             avg_losses["grad_g_50"].append(grad_norm_g)
             avg_losses["disc_loss_50"].append(loss_disc.detach())
+            avg_losses["adv_loss_50"].append(loss_gen.detach())
             avg_losses["fm_loss_50"].append(loss_fm.detach())
             avg_losses["kl_loss_50"].append(loss_kl.detach())
             avg_losses["mel_loss_50"].append(loss_mel.detach())
@@ -719,8 +793,11 @@ def train_and_evaluate(
                     / len(avg_losses["grad_d_50"]),
                     "grad_avg_50/norm_g": sum(avg_losses["grad_g_50"])
                     / len(avg_losses["grad_g_50"]),
-                    "loss_avg_50/d/total": torch.mean(
+                    "loss_avg_50/d/adv": torch.mean(
                         torch.stack(list(avg_losses["disc_loss_50"]))
+                    ),
+                    "loss_avg_50/g/adv": torch.mean(
+                        torch.stack(list(avg_losses["adv_loss_50"]))
                     ),
                     "loss_avg_50/g/fm": torch.mean(
                         torch.stack(list(avg_losses["fm_loss_50"]))
@@ -784,10 +861,11 @@ def train_and_evaluate(
 
         scalar_dict = {
             "loss/g/total": loss_gen_all,
-            "loss/d/total": loss_disc,
+            "loss/d/adv": loss_disc,
             "learning_rate": lr,
             "grad/norm_d": grad_norm_d,
             "grad/norm_g": grad_norm_g,
+            "loss/g/adv": loss_gen,
             "loss/g/fm": loss_fm,
             "loss/g/mel": loss_mel,
             "loss/g/kl": loss_kl,
@@ -800,11 +878,14 @@ def train_and_evaluate(
         }
 
         if epoch % save_every_epoch == 0:
-            with torch.no_grad():
-                if hasattr(net_g, "module"):
-                    o, *_ = net_g.module.infer(*reference)
-                else:
-                    o, *_ = net_g.infer(*reference)
+            with torch.amp.autocast(
+                device_type="cuda", enabled=use_amp, dtype=train_dtype
+            ):
+                with torch.no_grad():
+                    if hasattr(net_g, "module"):
+                        o, *_ = net_g.module.infer(*reference)
+                    else:
+                        o, *_ = net_g.infer(*reference)
             audio_dict = {f"gen/audio_{global_step:07d}": o[0, :, :]}
             summarize(
                 writer=writer,
@@ -929,6 +1010,7 @@ def train_and_evaluate(
                 config.train.learning_rate,
                 epoch,
                 os.path.join(experiment_dir, "G_" + checkpoint_suffix),
+                scaler,
             )
             save_checkpoint(
                 net_d,
@@ -936,6 +1018,7 @@ def train_and_evaluate(
                 config.train.learning_rate,
                 epoch,
                 os.path.join(experiment_dir, "D_" + checkpoint_suffix),
+                scaler,
             )
             if custom_save_every_weights:
                 model_add.append(
@@ -976,7 +1059,7 @@ def train_and_evaluate(
                 if not os.path.exists(m):
                     extract_model(
                         ckpt=ckpt,
-                        sr=sample_rate,
+                        sr=config.data.sample_rate,
                         name=model_name,
                         model_path=m,
                         epoch=epoch,

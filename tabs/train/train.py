@@ -299,6 +299,13 @@ def upload_to_google_drive(pth_path, index_path):
     upload_file(index_path)
 
 
+def auto_enable_checkpointing():
+    try:
+        return max_vram_gpu(0) < 6
+    except:
+        return False
+
+
 # Train Tab
 def train_tab():
     # Model settings section
@@ -440,7 +447,7 @@ def train_tab():
 
             with gr.Row():
                 process_effects = gr.Checkbox(
-                    label=i18n("Process effects"),
+                    label=i18n("Noise filter"),
                     info=i18n(
                         "It's recommended to deactivate this option if your dataset has already been processed."
                     ),
@@ -448,6 +455,18 @@ def train_tab():
                     interactive=True,
                     visible=True,
                 )
+
+                normalization_mode = gr.Radio(
+                    label=i18n("Normalization mode"),
+                    info=i18n(
+                        "Audio normalization: Select 'none' if the files are already normalized, 'pre' to normalize the entire input file at once, or 'post' to normalize each slice individually."
+                    ),
+                    choices=["none", "pre", "post"],
+                    value="none",
+                    interactive=True,
+                    visible=True,
+                )
+
                 noise_reduction = gr.Checkbox(
                     label=i18n("Noise Reduction"),
                     info=i18n(
@@ -491,6 +510,7 @@ def train_tab():
                     clean_strength,
                     chunk_len,
                     overlap_len,
+                    normalization_mode,
                 ],
                 outputs=[preprocess_output_info],
             )
@@ -503,7 +523,7 @@ def train_tab():
                 info=i18n(
                     "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                 ),
-                choices=["crepe", "crepe-tiny", "rmvpe"],
+                choices=["crepe", "crepe-tiny", "rmvpe", "fcpe"],
                 value="rmvpe",
                 interactive=True,
             )
@@ -513,6 +533,8 @@ def train_tab():
                 info=i18n("Model used for learning speaker embedding."),
                 choices=[
                     "contentvec",
+                    "spin",
+                    "spin-v2",
                     "chinese-hubert-base",
                     "japanese-hubert-base",
                     "korean-hubert-base",
@@ -533,37 +555,29 @@ def train_tab():
             value=True,
             interactive=True,
         )
-        hop_length = gr.Slider(
-            1,
-            512,
-            128,
-            step=1,
-            label=i18n("Hop Length"),
-            info=i18n(
-                "Denotes the duration it takes for the system to transition to a significant pitch change. Smaller hop lengths require more time for inference but tend to yield higher pitch accuracy."
-            ),
-            visible=False,
-            interactive=True,
-        )
         with gr.Row(visible=False) as embedder_custom:
-            with gr.Accordion("Custom Embedder", open=True):
+            with gr.Accordion(i18n("Custom Embedder"), open=True):
                 with gr.Row():
                     embedder_model_custom = gr.Dropdown(
-                        label="Select Custom Embedder",
+                        label=i18n("Select Custom Embedder"),
                         choices=refresh_embedders_folders(),
                         interactive=True,
                         allow_custom_value=True,
                     )
-                    refresh_embedders_button = gr.Button("Refresh embedders")
-                folder_name_input = gr.Textbox(label="Folder Name", interactive=True)
+                    refresh_embedders_button = gr.Button(i18n("Refresh embedders"))
+                folder_name_input = gr.Textbox(
+                    label=i18n("Folder Name"), interactive=True
+                )
                 with gr.Row():
                     bin_file_upload = gr.File(
-                        label="Upload .bin", type="filepath", interactive=True
+                        label=i18n("Upload .bin"), type="filepath", interactive=True
                     )
                     config_file_upload = gr.File(
-                        label="Upload .json", type="filepath", interactive=True
+                        label=i18n("Upload .json"), type="filepath", interactive=True
                     )
-                move_files_button = gr.Button("Move files to custom embedder folder")
+                move_files_button = gr.Button(
+                    i18n("Move files to custom embedder folder")
+                )
 
         extract_output_info = gr.Textbox(
             label=i18n("Output Information"),
@@ -578,7 +592,6 @@ def train_tab():
             inputs=[
                 model_name,
                 f0_method,
-                hop_length,
                 cpu_cores,
                 gpu,
                 sampling_rate,
@@ -594,8 +607,8 @@ def train_tab():
         with gr.Row():
             batch_size = gr.Slider(
                 1,
-                50,
-                max_vram_gpu(0),
+                64,
+                4,
                 step=1,
                 label=i18n("Batch Size"),
                 info=i18n(
@@ -672,7 +685,7 @@ def train_tab():
                         info=i18n(
                             "Enables memory-efficient training. This reduces VRAM usage at the cost of slower training speed. It is useful for GPUs with limited memory (e.g., <6GB VRAM) or when training with a batch size larger than what your GPU can normally accommodate."
                         ),
-                        value=False,
+                        value=auto_enable_checkpointing(),
                         interactive=True,
                     )
             with gr.Row():
@@ -864,11 +877,6 @@ def train_tab():
             def toggle_visible(checkbox):
                 return {"visible": checkbox, "__type__": "update"}
 
-            def toggle_visible_hop_length(f0_method):
-                if f0_method == "crepe" or f0_method == "crepe-tiny":
-                    return {"visible": True, "__type__": "update"}
-                return {"visible": False, "__type__": "update"}
-
             def toggle_pretrained(pretrained, custom_pretrained):
                 if custom_pretrained == False:
                     return {"visible": pretrained, "__type__": "update"}, {
@@ -954,11 +962,6 @@ def train_tab():
                 fn=save_drop_dataset_audio,
                 inputs=[upload_audio_dataset, dataset_name],
                 outputs=[upload_audio_dataset, dataset_path],
-            )
-            f0_method.change(
-                fn=toggle_visible_hop_length,
-                inputs=[f0_method],
-                outputs=[hop_length],
             )
             embedder_model.change(
                 fn=toggle_visible_embedder_custom,
